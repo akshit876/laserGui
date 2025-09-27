@@ -159,11 +159,28 @@ class ScannerController:
 
                 self.cycle_start_time = time.time()
 
-                # Phase 1: Wait for start signal
+                # Phase 1: Check start signal (since PLC hardware is connected)
                 self._notify_state_change(CycleState.WAITING)
-                result = await self.check_reset_or_bit(*PLCRegisterMap.START_SIGNAL, 1)
-                if result != "OK":
-                    await self.handle_reset_or_error(result)
+                self.logger.info("Checking START_SIGNAL from PLC (1410.0)...")
+                
+                # Add debug info before the read_bit call
+                self.logger.info("🔍 About to call plc.read_bit...")
+                
+                try:
+                    # Direct read of START_SIGNAL since we know PLC is connected
+                    start_signal = await self.plc.read_bit(*PLCRegisterMap.START_SIGNAL)
+                    self.logger.info(f"✅ Successfully read START_SIGNAL: {start_signal}")
+                    
+                    if not start_signal:
+                        self.logger.info("START_SIGNAL not active, waiting...")
+                        await asyncio.sleep(1.0)  # Wait 1 second and try again
+                        continue
+                    
+                    self.logger.info("✅ START_SIGNAL active, proceeding to first scan")
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Error reading START_SIGNAL: {e}")
+                    await asyncio.sleep(1.0)
                     continue
 
                 # Phase 2: First scan

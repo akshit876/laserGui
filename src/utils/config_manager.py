@@ -79,6 +79,7 @@ class LoggingConfig:
     max_file_size: int = 10485760  # 10MB
     backup_count: int = 5
     console_output: bool = True
+    log_file_path: str = "./logs/system.log"
 
 
 class ConfigurationManager:

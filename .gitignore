@@ -37,4 +37,4 @@ node_modules/
 
 # Ignore laserGui specific files
 config.json
-settings.ini
+settings.ini  

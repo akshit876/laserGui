@@ -381,20 +381,20 @@ class ScannerService:
 # Default scanner configuration
 DEFAULT_SCANNER_CONFIGS = {
     "main": {
-        "host": "192.168.1.100",
-        "port": 8080,
+        "host": "192.168.3.147",
+        "port": 502,
         "timeout": 30,
         "trigger_command": None,  # Some scanners need a trigger command
     },
     "middle": {
-        "host": "192.168.1.101",
-        "port": 8080,
+        "host": "192.168.3.148",
+        "port": 502,
         "timeout": 30,
         "trigger_command": None,
     },
     "verification": {
-        "host": "192.168.1.102",
-        "port": 8080,
+        "host": "192.168.3.147",
+        "port": 502,
         "timeout": 30,
         "trigger_command": None,
     },

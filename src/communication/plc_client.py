@@ -40,6 +40,9 @@ class PLCClient:
         self.client = None
         self.logger = logging.getLogger(__name__)
         self.is_connected = False
+        # Add semaphore to prevent concurrent operations
+        self._operation_semaphore = asyncio.Semaphore(1)
+        self._connection_lock = asyncio.Lock()
 
     async def connect(self) -> bool:
         """
@@ -48,39 +51,75 @@ class PLCClient:
         Returns:
             bool: True if connection successful, False otherwise
         """
-        try:
-            self.client = AsyncModbusTcpClient(
-                host=self.host, port=self.port, timeout=self.timeout
-            )
-            result = await self.client.connect()
-            self.is_connected = result
-
-            if self.is_connected:
-                self.logger.info(f"Connected to PLC at {self.host}:{self.port}")
-            else:
-                self.logger.error(
-                    f"Failed to connect to PLC at {self.host}:{self.port}"
+        async with self._connection_lock:
+            try:
+                # If already connected, close the existing connection first
+                if self.client and self.is_connected:
+                    await self.disconnect()
+                    
+                self.client = AsyncModbusTcpClient(
+                    host=self.host, port=self.port, timeout=self.timeout
                 )
+                result = await self.client.connect()
+                self.is_connected = result
 
-            return self.is_connected
+                if self.is_connected:
+                    self.logger.info(f"Connected to PLC at {self.host}:{self.port}")
+                else:
+                    self.logger.error(
+                        f"Failed to connect to PLC at {self.host}:{self.port}"
+                    )
 
-        except Exception as e:
-            self.logger.error(f"PLC connection error: {e}")
-            self.is_connected = False
-            return False
+                return self.is_connected
+
+            except Exception as e:
+                self.logger.error(f"PLC connection error: {e}")
+                self.is_connected = False
+                return False
 
     async def disconnect(self):
         """Disconnect from PLC"""
-        if self.client and self.is_connected:
-            await self.client.close()
-            self.is_connected = False
-            self.logger.info("Disconnected from PLC")
+        async with self._connection_lock:
+            if self.client and self.is_connected:
+                try:
+                    await self.client.close()
+                except Exception as e:
+                    self.logger.warning(f"Error during disconnect: {e}")
+                finally:
+                    self.is_connected = False
+                    self.client = None
+                    self.logger.info("Disconnected from PLC")
+
+    async def reconnect(self) -> bool:
+        """Force reconnection to PLC"""
+        await self.disconnect()
+        return await self.connect()
 
     async def _ensure_connection(self) -> bool:
-        """Ensure PLC connection is active"""
-        if not self.is_connected:
+        """Ensure PLC connection is active with connection health check"""
+        # First check if we think we're connected (without lock to avoid deadlock)
+        if not self.is_connected or not self.client:
+            self.logger.debug("Connection not established, attempting to connect")
             return await self.connect()
-        return True
+        
+        # Check if connection is actually healthy by attempting a simple read
+        try:
+            # Try to read a status register to verify connection health
+            test_result = await asyncio.wait_for(
+                self.client.read_holding_registers(address=1600, count=1),
+                timeout=1.0
+            )
+            if test_result.isError():
+                self.logger.warning("Connection health check failed, reconnecting")
+                self.is_connected = False
+                return await self.connect()
+                
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Connection health check error: {e}, reconnecting")
+            self.is_connected = False
+            return await self.connect()
 
     async def read_bit(self, register: int, bit: int) -> Optional[bool]:
         """
@@ -93,13 +132,23 @@ class PLCClient:
         Returns:
             bool: Bit value or None if error
         """
+        # Remove semaphore for read operations to prevent deadlock
+        self.logger.info(f"🔍 read_bit called for {register}.{bit}")
+        
         if not await self._ensure_connection():
+            self.logger.error(f"❌ _ensure_connection failed for {register}.{bit}")
             return None
+        
+        self.logger.info(f"🔍 Connection ensured, starting read attempts for {register}.{bit}")
 
         for attempt in range(self.retries):
             try:
-                # Read holding register
-                result = await self.client.read_holding_registers(address=register, count=1)
+                self.logger.info(f"🔍 Attempt {attempt + 1} reading register {register}")
+                # Read holding register with timeout
+                result = await asyncio.wait_for(
+                    self.client.read_holding_registers(address=register, count=1),
+                    timeout=self.timeout
+                )
 
                 if result.isError():
                     self.logger.error(f"Error reading register {register}: {result}")
@@ -108,16 +157,22 @@ class PLCClient:
                 register_value = result.registers[0]
                 bit_value = bool(register_value & (1 << bit))
 
-                self.logger.debug(f"Read bit {register}.{bit}: {bit_value}")
+                self.logger.info(f"✅ Successfully read bit {register}.{bit}: {bit_value}")
                 return bit_value
 
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Timeout reading bit {register}.{bit}")
+                # Mark connection as unhealthy and try to reconnect
+                self.is_connected = False
+                continue
             except Exception as e:
                 self.logger.error(
                     f"Attempt {attempt + 1} failed reading bit {register}.{bit}: {e}"
                 )
                 if attempt < self.retries - 1:
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.1)  # Reduced delay for better performance
 
+        self.logger.error(f"❌ All attempts failed for {register}.{bit}")
         return None
 
     async def write_bit(self, register: int, bit: int, value: bool) -> bool:
@@ -132,48 +187,60 @@ class PLCClient:
         Returns:
             bool: True if successful, False otherwise
         """
-        if not await self._ensure_connection():
+        async with self._operation_semaphore:
+            if not await self._ensure_connection():
+                return False
+
+            for attempt in range(self.retries):
+                try:
+                    # First read the current register value with timeout
+                    read_result = await asyncio.wait_for(
+                        self.client.read_holding_registers(address=register, count=1),
+                        timeout=self.timeout
+                    )
+
+                    if read_result.isError():
+                        self.logger.error(
+                            f"Error reading register {register} for bit write: {read_result}"
+                        )
+                        continue
+
+                    current_value = read_result.registers[0]
+
+                    # Modify the specific bit
+                    if value:
+                        new_value = current_value | (1 << bit)
+                    else:
+                        new_value = current_value & ~(1 << bit)
+
+                    # Write back the modified value with timeout
+                    write_result = await asyncio.wait_for(
+                        self.client.write_register(address=register, value=new_value),
+                        timeout=self.timeout
+                    )
+
+                    if write_result.isError():
+                        self.logger.error(
+                            f"Error writing register {register}: {write_result}"
+                        )
+                        continue
+
+                    self.logger.debug(f"Wrote bit {register}.{bit}: {value}")
+                    return True
+
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"Timeout writing bit {register}.{bit}")
+                    # Mark connection as unhealthy and try to reconnect
+                    self.is_connected = False
+                    continue
+                except Exception as e:
+                    self.logger.error(
+                        f"Attempt {attempt + 1} failed writing bit {register}.{bit}: {e}"
+                    )
+                    if attempt < self.retries - 1:
+                        await asyncio.sleep(0.1)  # Reduced delay for better performance
+
             return False
-
-        for attempt in range(self.retries):
-            try:
-                # First read the current register value
-                read_result = await self.client.read_holding_registers(address=register, count=1)
-
-                if read_result.isError():
-                    self.logger.error(
-                        f"Error reading register {register} for bit write: {read_result}"
-                    )
-                    continue
-
-                current_value = read_result.registers[0]
-
-                # Modify the specific bit
-                if value:
-                    new_value = current_value | (1 << bit)
-                else:
-                    new_value = current_value & ~(1 << bit)
-
-                # Write back the modified value
-                write_result = await self.client.write_register(address=register, value=new_value)
-
-                if write_result.isError():
-                    self.logger.error(
-                        f"Error writing register {register}: {write_result}"
-                    )
-                    continue
-
-                self.logger.debug(f"Wrote bit {register}.{bit}: {value}")
-                return True
-
-            except Exception as e:
-                self.logger.error(
-                    f"Attempt {attempt + 1} failed writing bit {register}.{bit}: {e}"
-                )
-                if attempt < self.retries - 1:
-                    await asyncio.sleep(0.5)
-
-        return False
 
     async def read_ascii_data(
         self, start_register: int, length: int = 20
@@ -188,47 +255,48 @@ class PLCClient:
         Returns:
             str: ASCII string or None if error
         """
-        if not await self._ensure_connection():
-            return None
+        async with self._operation_semaphore:
+            if not await self._ensure_connection():
+                return None
 
-        for attempt in range(self.retries):
-            try:
-                result = await self.client.read_holding_registers(
-                    address=start_register, count=length
-                )
-
-                if result.isError():
-                    self.logger.error(
-                        f"Error reading ASCII data from register {start_register}: {result}"
+            for attempt in range(self.retries):
+                try:
+                    result = await self.client.read_holding_registers(
+                        address=start_register, count=length
                     )
+
+                    if result.isError():
+                        self.logger.error(
+                            f"Error reading ASCII data from register {start_register}: {result}"
+                        )
                     continue
 
-                # Convert registers to ASCII string
-                ascii_bytes = []
-                for register_value in result.registers:
-                    # Each register contains 2 bytes (16 bits)
-                    high_byte = (register_value >> 8) & 0xFF
-                    low_byte = register_value & 0xFF
-                    ascii_bytes.extend([high_byte, low_byte])
+                    # Convert registers to ASCII string
+                    ascii_bytes = []
+                    for register_value in result.registers:
+                        # Each register contains 2 bytes (16 bits)
+                        high_byte = (register_value >> 8) & 0xFF
+                        low_byte = register_value & 0xFF
+                        ascii_bytes.extend([high_byte, low_byte])
 
-                # Convert bytes to string and remove null characters
-                ascii_string = (
-                    bytes(ascii_bytes).decode("ascii", errors="ignore").rstrip("\x00")
-                )
+                    # Convert bytes to string and remove null characters
+                    ascii_string = (
+                        bytes(ascii_bytes).decode("ascii", errors="ignore").rstrip("\x00")
+                    )
 
-                self.logger.debug(
-                    f"Read ASCII data from register {start_register}: '{ascii_string}'"
-                )
-                return ascii_string
+                    self.logger.debug(
+                        f"Read ASCII data from register {start_register}: '{ascii_string}'"
+                    )
+                    return ascii_string
 
-            except Exception as e:
-                self.logger.error(
-                    f"Attempt {attempt + 1} failed reading ASCII data from register {start_register}: {e}"
-                )
-                if attempt < self.retries - 1:
-                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    self.logger.error(
+                        f"Attempt {attempt + 1} failed reading ASCII data from register {start_register}: {e}"
+                    )
+                    if attempt < self.retries - 1:
+                        await asyncio.sleep(0.1)
 
-        return None
+            return None
 
     async def write_ascii_data(
         self, start_register: int, data: str, length: int = 20
@@ -244,45 +312,46 @@ class PLCClient:
         Returns:
             bool: True if successful, False otherwise
         """
-        if not await self._ensure_connection():
-            return False
+        async with self._operation_semaphore:
+            if not await self._ensure_connection():
+                return False
 
-        # Pad or truncate data to fit in specified registers
-        padded_data = data.ljust(length * 2, "\x00")[: length * 2]
+            # Pad or truncate data to fit in specified registers
+            padded_data = data.ljust(length * 2, "\x00")[: length * 2]
 
-        # Convert string to register values
-        register_values = []
-        for i in range(0, len(padded_data), 2):
-            high_byte = ord(padded_data[i]) if i < len(padded_data) else 0
-            low_byte = ord(padded_data[i + 1]) if i + 1 < len(padded_data) else 0
-            register_value = (high_byte << 8) | low_byte
-            register_values.append(register_value)
+            # Convert string to register values
+            register_values = []
+            for i in range(0, len(padded_data), 2):
+                high_byte = ord(padded_data[i]) if i < len(padded_data) else 0
+                low_byte = ord(padded_data[i + 1]) if i + 1 < len(padded_data) else 0
+                register_value = (high_byte << 8) | low_byte
+                register_values.append(register_value)
 
-        for attempt in range(self.retries):
-            try:
-                result = await self.client.write_registers(
-                    address=start_register, values=register_values
-                )
-
-                if result.isError():
-                    self.logger.error(
-                        f"Error writing ASCII data to register {start_register}: {result}"
+            for attempt in range(self.retries):
+                try:
+                    result = await self.client.write_registers(
+                        address=start_register, values=register_values
                     )
-                    continue
 
-                self.logger.debug(
-                    f"Wrote ASCII data to register {start_register}: '{data}'"
-                )
-                return True
+                    if result.isError():
+                        self.logger.error(
+                            f"Error writing ASCII data to register {start_register}: {result}"
+                        )
+                        continue
 
-            except Exception as e:
-                self.logger.error(
-                    f"Attempt {attempt + 1} failed writing ASCII data to register {start_register}: {e}"
-                )
-                if attempt < self.retries - 1:
-                    await asyncio.sleep(0.5)
+                    self.logger.debug(
+                        f"Wrote ASCII data to register {start_register}: '{data}'"
+                    )
+                    return True
 
-        return False
+                except Exception as e:
+                    self.logger.error(
+                        f"Attempt {attempt + 1} failed writing ASCII data to register {start_register}: {e}"
+                    )
+                    if attempt < self.retries - 1:
+                        await asyncio.sleep(0.1)
+
+            return False
 
     async def check_reset_or_bit(
         self, register: int, bit: int, expected_value: int, timeout: float = None
@@ -300,27 +369,53 @@ class PLCClient:
             str: "OK" if bit reached expected value, "RESET" if reset detected, "TIMEOUT" if timeout
         """
         start_time = asyncio.get_event_loop().time()
+        
+        # Use a single semaphore acquisition for the entire check to avoid deadlocks
+        async with self._operation_semaphore:
+            while True:
+                if not await self._ensure_connection():
+                    self.logger.error("Failed to ensure PLC connection")
+                    return "TIMEOUT"
 
-        while True:
-            # Check reset signal first
-            reset_signal = await self.read_bit(1600, 0)
-            if reset_signal:
-                self.logger.warning("Reset signal detected")
-                return "RESET"
+                try:
+                    # Check reset signal first
+                    reset_result = await asyncio.wait_for(
+                        self.client.read_holding_registers(address=1600, count=1),
+                        timeout=self.timeout
+                    )
+                    if not reset_result.isError():
+                        reset_value = reset_result.registers[0]
+                        if reset_value & 1:  # Check bit 0
+                            self.logger.warning("Reset signal detected")
+                            return "RESET"
 
-            # Check target bit
-            bit_value = await self.read_bit(register, bit)
-            if bit_value is not None and bit_value == bool(expected_value):
-                return "OK"
+                    # Check target bit
+                    bit_result = await asyncio.wait_for(
+                        self.client.read_holding_registers(address=register, count=1),
+                        timeout=self.timeout
+                    )
+                    if not bit_result.isError():
+                        register_value = bit_result.registers[0]
+                        bit_value = bool(register_value & (1 << bit))
+                        
+                        self.logger.info(f"🔍 Checking bit {register}.{bit}: read={bit_value}, expected={bool(expected_value)}")
+                        
+                        if bit_value == bool(expected_value):
+                            self.logger.info(f"✅ Bit {register}.{bit} reached expected value: {expected_value}")
+                            return "OK"
 
-            # Check timeout
-            if timeout and (asyncio.get_event_loop().time() - start_time) > timeout:
-                self.logger.warning(
-                    f"Timeout waiting for bit {register}.{bit} = {expected_value}"
-                )
-                return "TIMEOUT"
+                    # Check timeout
+                    if timeout and (asyncio.get_event_loop().time() - start_time) > timeout:
+                        self.logger.warning(
+                            f"Timeout waiting for bit {register}.{bit} = {expected_value}"
+                        )
+                        return "TIMEOUT"
 
-            await asyncio.sleep(0.1)  # 100ms polling interval
+                    await asyncio.sleep(0.1)  # 100ms polling interval
+                    
+                except Exception as e:
+                    self.logger.error(f"Error in check_reset_or_bit: {e}")
+                    return "TIMEOUT"
 
     async def reset_all_bits(self):
         """Reset all control and status bits to 0"""
